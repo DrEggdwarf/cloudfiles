@@ -18,7 +18,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -107,96 +106,7 @@ CREATE TABLE IF NOT EXISTS file_meta (
 	return err
 }
 
-// ─── Rate limiter ─────────────────────────────────────────────────────────────
-
-type RateLimiter struct {
-	mu      sync.Mutex
-	entries map[string][]time.Time
-	window  time.Duration
-	max     int
-}
-
-func newRateLimiter(max int, window time.Duration) *RateLimiter {
-	rl := &RateLimiter{
-		entries: make(map[string][]time.Time),
-		window:  window,
-		max:     max,
-	}
-	go func() {
-		ticker := time.NewTicker(10 * time.Minute)
-		for range ticker.C {
-			rl.mu.Lock()
-			now := time.Now()
-			for k, ts := range rl.entries {
-				var fresh []time.Time
-				for _, t := range ts {
-					if now.Sub(t) < rl.window {
-						fresh = append(fresh, t)
-					}
-				}
-				if len(fresh) == 0 {
-					delete(rl.entries, k)
-				} else {
-					rl.entries[k] = fresh
-				}
-			}
-			rl.mu.Unlock()
-		}
-	}()
-	return rl
-}
-
-func (rl *RateLimiter) Allow(ip string) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	now := time.Now()
-	ts := rl.entries[ip]
-	var fresh []time.Time
-	for _, t := range ts {
-		if now.Sub(t) < rl.window {
-			fresh = append(fresh, t)
-		}
-	}
-	if len(fresh) >= rl.max {
-		rl.entries[ip] = fresh
-		return false
-	}
-	fresh = append(fresh, now)
-	rl.entries[ip] = fresh
-	return true
-}
-
-// Exceeded tells whether ip already used its quota, without spending a request.
-func (rl *RateLimiter) Exceeded(ip string) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	now := time.Now()
-	count := 0
-	for _, t := range rl.entries[ip] {
-		if now.Sub(t) < rl.window {
-			count++
-		}
-	}
-	return count >= rl.max
-}
-
-var (
-	generalRL = newRateLimiter(120, time.Minute)
-	authRL    = newRateLimiter(5, 15*time.Minute)
-	uploadRL  = newRateLimiter(20, time.Minute)
-)
-
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[0])
-	}
-	ip := r.RemoteAddr
-	if idx := strings.LastIndex(ip, ":"); idx != -1 {
-		return ip[:idx]
-	}
-	return ip
-}
+const baseCSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:"
 
 // ─── Security middleware ──────────────────────────────────────────────────────
 
@@ -222,61 +132,9 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-XSS-Protection", "1; mode=block")
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:")
+		w.Header().Set("Content-Security-Policy", baseCSP)
 		next.ServeHTTP(w, r)
 	})
-}
-
-func rateLimitMiddleware(rl *RateLimiter, next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if !rl.Allow(clientIP(r)) {
-			jsonError(w, "Too Many Requests", http.StatusTooManyRequests)
-			return
-		}
-		next(w, r)
-	}
-}
-
-// ─── Auth middleware ──────────────────────────────────────────────────────────
-
-func extractBearer(r *http.Request) string {
-	auth := r.Header.Get("Authorization")
-	if strings.HasPrefix(auth, "Bearer ") {
-		return strings.TrimPrefix(auth, "Bearer ")
-	}
-	return ""
-}
-
-// adminAuth accepts either ADMIN_PASSWORD or AUTH_TOKEN as Bearer.
-func adminAuth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if !generalRL.Allow(clientIP(r)) {
-			jsonError(w, "Too Many Requests", http.StatusTooManyRequests)
-			return
-		}
-		token := extractBearer(r)
-		if token != "" && (token == adminPassword || token == authToken) {
-			next(w, r)
-			return
-		}
-		jsonError(w, "Unauthorized", http.StatusUnauthorized)
-	}
-}
-
-// tokenAuth accepts only AUTH_TOKEN (Firefox extension compatibility).
-func tokenAuth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if !generalRL.Allow(clientIP(r)) {
-			jsonError(w, "Too Many Requests", http.StatusTooManyRequests)
-			return
-		}
-		token := extractBearer(r)
-		if token != "" && token == authToken {
-			next(w, r)
-			return
-		}
-		jsonError(w, "Unauthorized", http.StatusUnauthorized)
-	}
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -501,7 +359,7 @@ func handleAuth(w http.ResponseWriter, r *http.Request) {
 	}
 	// Bearer token path
 	if bearer := extractBearer(r); bearer != "" {
-		if bearer == adminPassword || bearer == authToken {
+		if isAdminSecret(bearer) {
 			jsonOK(w, map[string]bool{"ok": true})
 			return
 		}
@@ -516,7 +374,7 @@ func handleAuth(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-	if body.Password == adminPassword || body.Password == authToken {
+	if isAdminSecret(body.Password) {
 		jsonOK(w, map[string]bool{"ok": true})
 		return
 	}
@@ -550,7 +408,7 @@ func handleFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := mkdirAllClaimed(dir); err != nil {
 			jsonError(w, "Could not create directory", http.StatusInternalServerError)
 			return
 		}
@@ -681,7 +539,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "Invalid path", http.StatusBadRequest)
 		return
 	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := mkdirAllClaimed(dir); err != nil {
 		jsonError(w, "Could not create directory", http.StatusInternalServerError)
 		return
 	}
@@ -695,6 +553,14 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A new name must not inherit the links of a file that once lived there; an
+	// overwrite keeps them, so a published file can be updated in place.
+	if _, err := os.Lstat(destPath); os.IsNotExist(err) {
+		if err := claimNewPath(toRelPath(destPath)); err != nil {
+			jsonError(w, "Could not create file", http.StatusInternalServerError)
+			return
+		}
+	}
 	out, err := os.Create(destPath)
 	if err != nil {
 		jsonError(w, "Could not create file", http.StatusInternalServerError)
@@ -744,7 +610,7 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	mime := mimeFromExt(info.Name())
 	w.Header().Set("Content-Type", mime)
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, info.Name()))
+	w.Header().Set("Content-Disposition", contentDisposition("attachment", info.Name()))
 	http.ServeFile(w, r, full)
 }
 
@@ -769,12 +635,13 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "Invalid path", http.StatusBadRequest)
 		return
 	}
-	if err := os.RemoveAll(full); err != nil {
+	if err := forgetPathRetry(rel); err != nil {
 		jsonError(w, "Could not delete", http.StatusInternalServerError)
 		return
 	}
-	if err := forgetPath(rel); err != nil {
-		log.Printf("delete: could not clean records: %v", err)
+	if err := os.RemoveAll(full); err != nil {
+		jsonError(w, "Could not delete", http.StatusInternalServerError)
+		return
 	}
 	jsonOK(w, map[string]interface{}{"success": true, "message": "Deleted successfully"})
 }
@@ -823,12 +690,9 @@ func handleRename(w http.ResponseWriter, r *http.Request) {
 	}
 	oldRel := toRelPath(oldFull)
 	newRel := toRelPath(newFull)
-	if err := os.Rename(oldFull, newFull); err != nil {
+	if err := renameTracked(oldFull, newFull, oldRel, newRel); err != nil {
 		jsonError(w, "Could not rename", http.StatusInternalServerError)
 		return
-	}
-	if err := movePath(oldRel, newRel); err != nil {
-		log.Printf("rename: could not move records: %v", err)
 	}
 	jsonOK(w, map[string]interface{}{"success": true, "message": "Renamed successfully", "new_path": newRel})
 }
@@ -927,7 +791,7 @@ func handleMkdir(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "Invalid path", http.StatusBadRequest)
 		return
 	}
-	if err := os.MkdirAll(full, 0755); err != nil {
+	if err := mkdirAllClaimed(full); err != nil {
 		jsonError(w, "Could not create directory", http.StatusInternalServerError)
 		return
 	}
@@ -1262,12 +1126,15 @@ func handleFileSlug(w http.ResponseWriter, r *http.Request) {
 	switch action {
 	case "dl":
 		w.Header().Set("Content-Type", mime)
-		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, info.Name()))
+		w.Header().Set("Content-Disposition", contentDisposition("attachment", info.Name()))
 		http.ServeFile(w, r, full)
 	case "preview", "":
 		// Both bare /f/{slug} and /f/{slug}/preview serve inline
 		w.Header().Set("Content-Type", mime)
-		w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, info.Name()))
+		if isActiveMime(mime) {
+			w.Header().Set("Content-Security-Policy", publishedCSP)
+		}
+		w.Header().Set("Content-Disposition", contentDisposition("inline", info.Name()))
 		http.ServeFile(w, r, full)
 	default:
 		http.NotFound(w, r)
@@ -1359,7 +1226,7 @@ func handleShareSlug(w http.ResponseWriter, r *http.Request) {
 				time.Now().UTC().Format(time.RFC3339), slug)
 			zipName := filename + ".zip"
 			w.Header().Set("Content-Type", "application/zip")
-			w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, zipName))
+			w.Header().Set("Content-Disposition", contentDisposition("attachment", zipName))
 			zw := zip.NewWriter(w)
 			defer zw.Close()
 			filepath.Walk(full, func(path string, info os.FileInfo, err error) error {
@@ -1390,7 +1257,7 @@ func handleShareSlug(w http.ResponseWriter, r *http.Request) {
 			db.Exec(`UPDATE shares SET uses_count = uses_count + 1, last_downloaded_at = ? WHERE slug = ?`,
 				time.Now().UTC().Format(time.RFC3339), slug)
 			w.Header().Set("Content-Type", mime)
-			w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+			w.Header().Set("Content-Disposition", contentDisposition("attachment", filename))
 			http.ServeFile(w, r, full)
 		}
 	case "preview":
@@ -1403,8 +1270,11 @@ func handleShareSlug(w http.ResponseWriter, r *http.Request) {
 			renderPage(w, FilePageData{IsShare: true, Error: "Ce fichier n'existe plus."})
 			return
 		}
+		if isActiveMime(mime) || isActiveMime(mimeFromExt(full)) {
+			w.Header().Set("Content-Security-Policy", sharedCSP)
+		}
 		w.Header().Set("Content-Type", mime)
-		w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, filename))
+		w.Header().Set("Content-Disposition", contentDisposition("inline", filename))
 		http.ServeFile(w, r, full)
 	default:
 		expiresStr := ""
@@ -1453,7 +1323,10 @@ func handleShareSlug(w http.ResponseWriter, r *http.Request) {
 
 // ─── AI Analysis ──────────────────────────────────────────────────────────────
 
-func anthropicCall(model string, maxTokens int, messages []map[string]interface{}) (string, error) {
+// anthropicCall is a variable so the tests can stand in for the API.
+var anthropicCall = callAnthropic
+
+func callAnthropic(model string, maxTokens int, messages []map[string]interface{}) (string, error) {
 	body := map[string]interface{}{
 		"model":      model,
 		"max_tokens": maxTokens,
@@ -1511,6 +1384,7 @@ func analyzeFile(relPath string) {
 	if err != nil || info.IsDir() {
 		return
 	}
+	relPath = toRelPath(full)
 
 	mime := mimeFromExt(info.Name())
 	filename := info.Name()
@@ -1597,9 +1471,14 @@ Règles:
 		return
 	}
 
+	// The call took seconds: if the file went away or was replaced meanwhile, this meta
+	// would describe something else, or wait for the next file created at this path.
+	if now, err := os.Stat(full); err != nil || !os.SameFile(info, now) {
+		return
+	}
 	tagsJSON, _ := json.Marshal(meta.Tags)
 	if _, err := db.Exec(`INSERT OR REPLACE INTO file_meta (path, description, tags, ai_name, analyzed_at) VALUES (?, ?, ?, ?, ?)`,
-		relPath, meta.Description, string(tagsJSON), meta.AiName, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		relPath, meta.Description, string(tagsJSON), sanitizeAIName(meta.AiName, filename), time.Now().UTC().Format(time.RFC3339)); err != nil {
 		log.Printf("analyzeFile %s: DB error: %v", relPath, err)
 	}
 }
@@ -1618,8 +1497,23 @@ func handleMeta(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "path requis", http.StatusBadRequest)
 		return
 	}
+	// Meta only for an existing file, under the same key as the listing uses.
+	full, err := safePath(filesDir, body.Path)
+	if err != nil {
+		jsonError(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
+	if _, err := os.Lstat(full); err != nil {
+		jsonError(w, "File not found", http.StatusNotFound)
+		return
+	}
+	body.Path = toRelPath(full)
+	if checkRel(body.Path) != nil {
+		jsonError(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
 	tagsJSON, _ := json.Marshal(body.Tags)
-	_, err := db.Exec(`INSERT OR REPLACE INTO file_meta (path, description, tags, ai_name, analyzed_at)
+	_, err = db.Exec(`INSERT OR REPLACE INTO file_meta (path, description, tags, ai_name, analyzed_at)
 		VALUES (?, ?, ?, COALESCE((SELECT ai_name FROM file_meta WHERE path=?), ''), COALESCE((SELECT analyzed_at FROM file_meta WHERE path=?), ?))`,
 		body.Path, body.Description, string(tagsJSON), body.Path, body.Path, time.Now().UTC().Format(time.RFC3339))
 	if err != nil {
@@ -1778,7 +1672,8 @@ func loadConfig() {
 	dbPath = getenv("DB_PATH", "/data/cloud.db")
 	port = getenv("PORT", "8080")
 	anthropicKey = getenv("ANTHROPIC_API_KEY", "")
-	if err := configureDAV(os.Getenv("DAV_USER"), os.Getenv("DAV_PASSWORD_SHA256")); err != nil {
+	davRoot = os.Getenv("DAV_ROOT")
+	if err := configureDAV(os.Getenv("DAV_USER"), os.Getenv("DAV_PASSWORD_BCRYPT")); err != nil {
 		log.Printf("WebDAV disabled: %v", err)
 	} else {
 		log.Printf("WebDAV enabled on %s/", davPrefix)
@@ -1832,7 +1727,13 @@ func newServer() http.Handler {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "dav-hash" {
+		os.Exit(runDAVHash(os.Stdin, os.Stdout, os.Stderr))
+	}
 	loadConfig()
+	if err := validateSecrets(); err != nil {
+		log.Fatalf("Refusing to start: %v", err)
+	}
 
 	if err := os.MkdirAll(filesDir, 0755); err != nil {
 		log.Fatalf("Could not create files dir: %v", err)
@@ -1848,10 +1749,17 @@ func main() {
 		log.Fatalf("Template init error: %v", err)
 	}
 	removeDAVLeftovers(filesDir)
+	if err := sweepOrphanRecords(); err != nil {
+		log.Printf("orphan sweep: %v", err)
+	}
 
-	handler := newServer()
+	server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           newServer(),
+		ReadHeaderTimeout: 20 * time.Second,
+	}
 	log.Printf("Cloud server listening on :%s (base: %s, files: %s)", port, baseURL, filesDir)
-	if err := http.ListenAndServe(":"+port, handler); err != nil {
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Server error: %v", err)
 	}
 }

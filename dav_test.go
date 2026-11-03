@@ -3,6 +3,9 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"sync"
+
+	"golang.org/x/crypto/bcrypt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,21 +21,38 @@ const (
 	testDAVPassword = "un-mot-de-passe-d-application"
 )
 
-func sha256Hex(s string) string {
-	sum := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(sum[:])
+var (
+	hashOnce sync.Once
+	hashes   = map[string]string{}
+)
+
+// bcryptOf hashes at the lowest accepted cost, once per password for the whole run.
+func bcryptOf(t *testing.T, pass string) string {
+	t.Helper()
+	hashOnce.Do(func() {
+		for _, p := range []string{testDAVPassword, testAdminPassword, testAuthToken, ""} {
+			h, err := bcrypt.GenerateFromPassword([]byte(p), davMinBcryptCost)
+			if err != nil {
+				panic(err)
+			}
+			hashes[p] = string(h)
+		}
+	})
+	h, ok := hashes[pass]
+	if !ok {
+		t.Fatalf("no precomputed hash for %q", pass)
+	}
+	return h
 }
 
 // setupDAV starts a server with WebDAV on, and returns a channel of analysed paths.
 func setupDAV(t *testing.T) (http.Handler, chan string) {
 	t.Helper()
 	h := setupServer(t)
-	if err := configureDAV(testDAVUser, sha256Hex(testDAVPassword)); err != nil {
+	if err := configureDAV(testDAVUser, bcryptOf(t, testDAVPassword)); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { configureDAV("", "") })
-	davFailRL = newRateLimiter(5, 15*time.Minute)
-	davRL = newRateLimiter(10000, time.Minute)
 	analysed := make(chan string, 16)
 	davAnalyze = func(rel string) { analysed <- rel }
 	davAnalyzeDelay = 0
@@ -88,19 +108,66 @@ func TestDAVConfiguration(t *testing.T) {
 		t.Fatal("empty config accepted")
 	}
 	expectStatus(t, davDo(t, h, "PROPFIND", "/dav/", "", "Depth", "1"), 404)
-	if err := configureDAV("iji", "pas-de-l-hexa"); err == nil {
-		t.Fatal("bad digest accepted")
+	sum := sha256.Sum256([]byte(testDAVPassword))
+	for name, hash := range map[string]string{
+		"not a hash":            "pas-un-hash",
+		"a SHA-256 digest":      hex.EncodeToString(sum[:]),
+		"a cheap bcrypt":        mustBcrypt(t, testDAVPassword, bcrypt.MinCost),
+		"the empty password":    bcryptOf(t, ""),
+		"ADMIN_PASSWORD reused": bcryptOf(t, testAdminPassword),
+		"AUTH_TOKEN reused":     bcryptOf(t, testAuthToken),
+	} {
+		if err := configureDAV("iji", hash); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+		if checkDAVCredentials("iji", "") {
+			t.Fatalf("%s: empty password opens WebDAV", name)
+		}
 	}
-	if err := configureDAV("iji", sha256Hex(testAdminPassword)); err == nil {
-		t.Fatal("admin password reused for WebDAV")
+	if err := configureDAV("iji", "  "+bcryptOf(t, testDAVPassword)+"\n"); err != nil {
+		t.Fatalf("padded hash refused: %v", err)
 	}
-	if err := configureDAV("iji", sha256Hex(testAuthToken)); err == nil {
-		t.Fatal("AUTH_TOKEN reused for WebDAV")
+	if err := configureDAV("iji", "'"+bcryptOf(t, testDAVPassword)+"'"); err != nil {
+		t.Fatalf("quoted hash refused: %v", err)
 	}
-	if err := configureDAV("iji", strings.ToUpper(sha256Hex(testDAVPassword))); err != nil {
-		t.Fatalf("upper-case digest refused: %v", err)
+	if !checkDAVCredentials("iji", testDAVPassword) || checkDAVCredentials("iji", "") || checkDAVCredentials("IJI", testDAVPassword) {
+		t.Fatal("credential check")
 	}
 	configureDAV("", "")
+	if checkDAVCredentials("iji", testDAVPassword) {
+		t.Fatal("cached credentials survived a reconfiguration")
+	}
+}
+
+func mustBcrypt(t *testing.T, pass string, cost int) string {
+	t.Helper()
+	h, err := bcrypt.GenerateFromPassword([]byte(pass), cost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(h)
+}
+
+func TestDAVHashCommand(t *testing.T) {
+	var out, errOut strings.Builder
+	if code := runDAVHash(strings.NewReader(testDAVPassword+"\n"), &out, &errOut); code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+	hash := strings.TrimSpace(out.String())
+	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(testDAVPassword)) != nil {
+		t.Fatal("hash does not match")
+	}
+	if cost, _ := bcrypt.Cost([]byte(hash)); cost < davMinBcryptCost {
+		t.Fatalf("cost %d", cost)
+	}
+	if strings.Contains(out.String()+errOut.String(), testDAVPassword) {
+		t.Fatal("password echoed")
+	}
+	for _, bad := range []string{"", "\n", strings.Repeat("x", 73)} {
+		if runDAVHash(strings.NewReader(bad), &out, &errOut) == 0 {
+			t.Errorf("accepted %q", bad)
+		}
+	}
 }
 
 func TestDAVAuth(t *testing.T) {

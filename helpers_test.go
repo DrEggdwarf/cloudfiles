@@ -32,6 +32,12 @@ func setupServer(t *testing.T) http.Handler {
 	generalRL = newRateLimiter(10000, time.Minute)
 	authRL = newRateLimiter(5, 15*time.Minute)
 	uploadRL = newRateLimiter(10000, time.Minute)
+	adminFails = newFailGuard(20, 15*time.Minute)
+	davFails = newFailGuard(5, 15*time.Minute)
+	davRL = newRateLimiter(10000, time.Minute)
+	davRoot = ""
+	davReserveBytes = 256 << 20
+	freeBytes = func(string) (int64, error) { return 1 << 40, nil }
 	if err := os.MkdirAll(filesDir, 0755); err != nil {
 		t.Fatal(err)
 	}

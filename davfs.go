@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
-	"log"
 	"os"
 	"path"
 	"path/filepath"
@@ -14,12 +14,14 @@ import (
 	"golang.org/x/net/webdav"
 )
 
-// davFS is the WebDAV view of filesDir. Unlike webdav.Dir it refuses symbolic links
-// (nothing may lead out of the root), writes through a temporary file renamed into place
-// (an interrupted upload never truncates the previous version), and keeps cloud.db in step
-// on DELETE and MOVE.
+// davFS is the WebDAV view of filesDir (or of its DAV_ROOT sub-folder). Unlike webdav.Dir
+// it refuses symbolic links (nothing may lead out of the root), writes through a temporary
+// file renamed into place (an interrupted upload never truncates the previous version), and
+// keeps cloud.db in step: a creation clears its path first, DELETE drops the records before
+// the files, MOVE carries them along or is undone.
 type davFS struct {
-	root string
+	root   string // absolute folder served at /dav/
+	prefix string // that folder relative to filesDir, as cloud.db keys it ("" for filesDir)
 }
 
 // davTempPrefix marks in-flight uploads; they are hidden from listings and unreachable by URL.
@@ -27,9 +29,34 @@ const davTempPrefix = ".cloudfiles-dav-"
 
 var errUploadAborted = errors.New("upload aborted")
 
-// davRel turns a WebDAV name ("/a/b", "a/../b") into the relative path cloud.db keys on ("a/b").
+func newDAVFS() (*davFS, error) {
+	root := filepath.Clean(filesDir)
+	sub := davRel(davRoot)
+	if sub == "" {
+		return &davFS{root: root}, nil
+	}
+	full, err := (&davFS{root: root}).resolve(sub)
+	if err != nil {
+		return nil, fmt.Errorf("DAV_ROOT: %w", err)
+	}
+	if err := mkdirAllClaimed(full); err != nil {
+		return nil, fmt.Errorf("DAV_ROOT: %w", err)
+	}
+	return &davFS{root: full, prefix: sub}, nil
+}
+
+// davRel turns a WebDAV name ("/a/b", "a/../b") into a clean relative path ("a/b").
 func davRel(name string) string {
 	return strings.TrimPrefix(path.Clean("/"+name), "/")
+}
+
+// dbRel is the cloud.db key of a WebDAV name.
+func (d *davFS) dbRel(name string) string {
+	rel := davRel(name)
+	if d.prefix == "" || rel == "" {
+		return path.Join(d.prefix, rel)
+	}
+	return d.prefix + "/" + rel
 }
 
 func (d *davFS) resolve(name string) (string, error) {
@@ -68,9 +95,20 @@ func (d *davFS) resolve(name string) (string, error) {
 	return full, nil
 }
 
+func exists(full string) bool {
+	_, err := os.Lstat(full)
+	return err == nil
+}
+
 func (d *davFS) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
 	full, err := d.resolve(name)
 	if err != nil {
+		return err
+	}
+	if exists(full) {
+		return os.ErrExist
+	}
+	if err := claimNewPath(d.dbRel(name)); err != nil {
 		return err
 	}
 	return os.Mkdir(full, 0755)
@@ -95,8 +133,18 @@ func (d *davFS) OpenFile(ctx context.Context, name string, flag int, perm os.Fil
 	if full == filepath.Clean(d.root) {
 		return nil, &os.PathError{Op: "open", Path: name, Err: syscall.EISDIR}
 	}
-	if fi, err := os.Lstat(full); err == nil && fi.IsDir() {
+	fi, err := os.Lstat(full)
+	switch {
+	case err == nil && fi.IsDir():
 		return nil, &os.PathError{Op: "open", Path: name, Err: syscall.EISDIR}
+	case os.IsNotExist(err):
+		// A new name must not inherit the links of a file that once lived there; an
+		// overwrite keeps them, so a published file can be updated in place.
+		if err := claimNewPath(d.dbRel(name)); err != nil {
+			return nil, err
+		}
+	case err != nil:
+		return nil, err
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(full), davTempPrefix+"*")
 	if err != nil {
@@ -119,13 +167,10 @@ func (d *davFS) RemoveAll(ctx context.Context, name string) error {
 	if full == filepath.Clean(d.root) {
 		return os.ErrInvalid
 	}
-	if err := os.RemoveAll(full); err != nil {
+	if err := forgetPathRetry(d.dbRel(name)); err != nil {
 		return err
 	}
-	if err := forgetPath(davRel(name)); err != nil {
-		log.Printf("dav: could not clean records after delete: %v", err)
-	}
-	return nil
+	return os.RemoveAll(full)
 }
 
 func (d *davFS) Rename(ctx context.Context, oldName, newName string) error {
@@ -141,13 +186,7 @@ func (d *davFS) Rename(ctx context.Context, oldName, newName string) error {
 	if oldFull == root || newFull == root {
 		return os.ErrInvalid
 	}
-	if err := os.Rename(oldFull, newFull); err != nil {
-		return err
-	}
-	if err := movePath(davRel(oldName), davRel(newName)); err != nil {
-		log.Printf("dav: could not move records: %v", err)
-	}
-	return nil
+	return renameTracked(oldFull, newFull, d.dbRel(oldName), d.dbRel(newName))
 }
 
 func (d *davFS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
@@ -232,13 +271,3 @@ type namedInfo struct {
 }
 
 func (n namedInfo) Name() string { return n.name }
-
-// removeDAVLeftovers deletes temporary files a crash may have left behind mid-upload.
-func removeDAVLeftovers(root string) {
-	filepath.WalkDir(root, func(p string, e fs.DirEntry, err error) error {
-		if err == nil && e.Type().IsRegular() && strings.HasPrefix(e.Name(), davTempPrefix) {
-			os.Remove(p)
-		}
-		return nil
-	})
-}

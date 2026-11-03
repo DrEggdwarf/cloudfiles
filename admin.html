@@ -1295,9 +1295,9 @@ function renderListView(container, items) {
   const header = `
     <div class="file-table-header">
       <div></div>
-      <button class="col-header" onclick="setSort('name')">Nom${arrow('name')}</button>
-      <button class="col-header" onclick="setSort('size')">Taille${arrow('size')}</button>
-      <button class="col-header" onclick="setSort('date')">Date${arrow('date')}</button>
+      <button class="col-header" ${dataAttrs('sort', { key: 'name' })}>Nom${arrow('name')}</button>
+      <button class="col-header" ${dataAttrs('sort', { key: 'size' })}>Taille${arrow('size')}</button>
+      <button class="col-header" ${dataAttrs('sort', { key: 'date' })}>Date${arrow('date')}</button>
       <div>Actions</div>
     </div>`;
   const rows = items.map(item => renderListRow(item)).join('');
@@ -1310,14 +1310,14 @@ function renderListRow(item) {
   const hasAi = !isFolder && (item.description || (item.tags && item.tags.length));
   const nameCls = isFolder ? 'file-name clickable' : 'file-name';
   const nameClick = isFolder
-    ? `onclick="loadFiles('${esc(item.path)}')" ondblclick="startRenameFolder(event, '${esc(item.path)}', '${esc(item.name)}')"`
-    : `ondblclick="startRename(this, '${esc(item.path)}', '${esc(item.name)}')"`;
+    ? `data-action="open" data-dblaction="renameFolder"`
+    : `data-dblaction="rename"`;
   const size = isFolder ? `${item.item_count ?? 0} élément(s)` : fmtSize(item.size);
   const date = item.modified ? fmtDate(item.modified) : '—';
   const actions = renderListActions(item);
   const iconEl = isFolder
     ? `<span class="file-icon folder-icon">${icon}</span>`
-    : `<button class="file-icon file-icon-btn${hasAi ? ' ai-analyzed' : ''}" onclick="openAiModal('${esc(item.path)}')" title="${hasAi ? 'Infos IA' : 'Analyser avec l\'IA'}">${icon}</button>`;
+    : `<button class="file-icon file-icon-btn${hasAi ? ' ai-analyzed' : ''}" ${dataAttrs('ai', { path: item.path })} title="${hasAi ? 'Infos IA' : 'Analyser avec l\'IA'}">${icon}</button>`;
   return `
 <div class="file-row">
   <div class="file-row-check"></div>
@@ -1337,40 +1337,40 @@ function renderListActions(item) {
   const isFolder = item.type === 'folder';
   if (isFolder) {
     return `
-      <button class="btn btn-ghost btn-xs" onclick="loadFiles('${esc(item.path)}')" title="Ouvrir">
+      <button class="btn btn-ghost btn-xs" ${dataAttrs('open', { path: item.path })} title="Ouvrir">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
       </button>
-      <button class="btn btn-ghost btn-xs" onclick="startRenameFolder(event, '${esc(item.path)}', '${esc(item.name)}')" title="Renommer">
+      <button class="btn btn-ghost btn-xs" ${dataAttrs('renameFolder', { path: item.path, name: item.name })} title="Renommer">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
       </button>
-      <button class="btn btn-ghost btn-xs" onclick="openShareModal('${esc(item.path)}', '${esc(item.name)}', true)" title="Partager le dossier">
+      <button class="btn btn-ghost btn-xs" ${dataAttrs('share', { path: item.path, name: item.name, folder: 1 })} title="Partager le dossier">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
       </button>
-      <button class="btn btn-danger btn-xs" onclick="deleteItem('${esc(item.path)}', true)" title="Supprimer">
+      <button class="btn btn-danger btn-xs" ${dataAttrs('delete', { path: item.path, folder: 1 })} title="Supprimer">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
       </button>`;
   }
   // File actions: Télécharger | Partager | [copier URL + dépublier si public_url] [publier sinon] | Supprimer
   const hasURL = !!(item.public_url);
   const publishBtn = hasURL
-    ? `<button class="btn btn-ghost btn-xs" onclick="copyPublicURL('${esc(item.public_url)}')" title="Copier URL publique">
+    ? `<button class="btn btn-ghost btn-xs" ${dataAttrs('copyUrl', { url: item.public_url })} title="Copier URL publique">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
       </button>
-      <button class="btn btn-ghost btn-xs" onclick="unpublishFile('${esc(item.path)}')" title="Dépublier">
+      <button class="btn btn-ghost btn-xs" ${dataAttrs('unpublish', { path: item.path })} title="Dépublier">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
       </button>`
-    : `<button class="btn btn-ghost btn-xs" onclick="publishFile('${esc(item.path)}')" title="Publier">
+    : `<button class="btn btn-ghost btn-xs" ${dataAttrs('publish', { path: item.path })} title="Publier">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
       </button>`;
   return `
-    <button class="btn btn-ghost btn-xs" onclick="downloadFile('${esc(item.path)}', '${esc(item.name)}')" title="Télécharger">
+    <button class="btn btn-ghost btn-xs" ${dataAttrs('download', { path: item.path, name: item.name })} title="Télécharger">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
     </button>
-    <button class="btn btn-ghost btn-xs" onclick="openShareModal('${esc(item.path)}', '${esc(item.name)}', false)" title="Partager">
+    <button class="btn btn-ghost btn-xs" ${dataAttrs('share', { path: item.path, name: item.name, folder: 0 })} title="Partager">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
     </button>
     ${publishBtn}
-    <button class="btn btn-danger btn-xs" onclick="deleteItem('${esc(item.path)}', false)" title="Supprimer">
+    <button class="btn btn-danger btn-xs" ${dataAttrs('delete', { path: item.path, folder: 0 })} title="Supprimer">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
     </button>`;
 }
@@ -1384,36 +1384,36 @@ function renderGridView(container, items) {
     const isFolder = item.type === 'folder';
     const previewHTML = buildGridPreview(item);
     const meta = isFolder ? `${item.item_count ?? 0} élément(s)` : fmtSize(item.size);
-    const previewClick = isFolder ? `onclick="loadFiles('${esc(item.path)}')" style="cursor:pointer"` : '';
+    const previewClick = isFolder ? `data-action="open" style="cursor:pointer"` : '';
     let actions;
     if (isFolder) {
       actions = `
-        <button class="btn btn-ghost btn-xs" onclick="openShareModal('${esc(item.path)}', '${esc(item.name)}', true)" title="Partager le dossier">
+        <button class="btn btn-ghost btn-xs" ${dataAttrs('share', { path: item.path, name: item.name, folder: 1 })} title="Partager le dossier">
           <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
         </button>
-        <button class="btn btn-danger btn-xs" onclick="deleteItem('${esc(item.path)}', true)" title="Supprimer">
+        <button class="btn btn-danger btn-xs" ${dataAttrs('delete', { path: item.path, folder: 1 })} title="Supprimer">
           <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
         </button>`;
     } else {
       const hasURL = !!(item.public_url);
       const copyURLBtn = hasURL
-        ? `<button class="btn btn-ghost btn-xs" onclick="copyPublicURL('${esc(item.public_url)}')" title="Copier URL publique">
+        ? `<button class="btn btn-ghost btn-xs" ${dataAttrs('copyUrl', { url: item.public_url })} title="Copier URL publique">
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
           </button>` : '';
       const publishToggleBtn = hasURL
-        ? `<button class="btn btn-ghost btn-xs" onclick="unpublishFile('${esc(item.path)}')" title="Dépublier">
+        ? `<button class="btn btn-ghost btn-xs" ${dataAttrs('unpublish', { path: item.path })} title="Dépublier">
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
           </button>`
-        : `<button class="btn btn-ghost btn-xs" onclick="publishFile('${esc(item.path)}')" title="Publier">
+        : `<button class="btn btn-ghost btn-xs" ${dataAttrs('publish', { path: item.path })} title="Publier">
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
           </button>`;
       actions = `
         ${copyURLBtn}
-        <button class="btn btn-ghost btn-xs" onclick="openShareModal('${esc(item.path)}', '${esc(item.name)}', false)" title="Partager">
+        <button class="btn btn-ghost btn-xs" ${dataAttrs('share', { path: item.path, name: item.name, folder: 0 })} title="Partager">
           <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
         </button>
         ${publishToggleBtn}
-        <button class="btn btn-danger btn-xs" onclick="deleteItem('${esc(item.path)}', false)" title="Supprimer">
+        <button class="btn btn-danger btn-xs" ${dataAttrs('delete', { path: item.path, folder: 0 })} title="Supprimer">
           <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
         </button>`;
     }
@@ -1423,7 +1423,7 @@ function renderGridView(container, items) {
     ${previewHTML}
   </div>
   <div class="grid-info">
-    <div class="grid-name" title="${escAttr(item.name)}" ondblclick="startGridRename(event, '${esc(item.path)}', '${esc(item.name)}')">${escHtml(item.name)}</div>
+    <div class="grid-name" title="${escAttr(item.name)}" ${dataAttrs('gridRename', { path: item.path, name: item.name }, 'dblaction')}>${escHtml(item.name)}</div>
     <div class="grid-meta">${meta}</div>
     <div class="grid-actions">${actions}</div>
   </div>
@@ -1465,7 +1465,7 @@ async function loadGridPreviews() {
 // ── Navigation ────────────────────────────────────────────────────────────────
 function updateBreadcrumb() {
   const bc = document.getElementById('breadcrumb');
-  let html = `<button class="breadcrumb-item${!currentPath ? ' current' : ''}" onclick="loadFiles('')">Accueil</button>`;
+  let html = `<button class="breadcrumb-item${!currentPath ? ' current' : ''}" ${dataAttrs('open', { path: '' })}>Accueil</button>`;
   if (currentPath) {
     const parts = currentPath.split('/').filter(Boolean);
     let acc = '';
@@ -1474,7 +1474,7 @@ function updateBreadcrumb() {
       const path = acc;
       const isCurrent = i === parts.length - 1;
       html += `<span class="breadcrumb-sep">›</span>`;
-      html += `<button class="breadcrumb-item${isCurrent ? ' current' : ''}" onclick="loadFiles('${esc(path)}')">${escHtml(p)}</button>`;
+      html += `<button class="breadcrumb-item${isCurrent ? ' current' : ''}" ${dataAttrs('open', { path })}>${escHtml(p)}</button>`;
     });
   }
   bc.innerHTML = html;
@@ -1853,10 +1853,10 @@ async function loadShares() {
   </div>
   <div class="share-url-wrap">
     <span class="share-url-text" title="${escAttr(s.url)}">${escHtml(s.url)}</span>
-    <button class="btn btn-ghost btn-xs" onclick="navigator.clipboard.writeText('${esc(s.url)}').then(()=>toast('Copié','success'))" title="Copier">
+    <button class="btn btn-ghost btn-xs" ${dataAttrs('copyShare', { url: s.url })} title="Copier">
       <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
     </button>
-    <button class="btn btn-danger btn-xs" onclick="deleteShare('${esc(s.slug)}')" title="Supprimer">
+    <button class="btn btn-danger btn-xs" ${dataAttrs('deleteShare', { slug: s.slug })} title="Supprimer">
       <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
     </button>
   </div>
@@ -1868,7 +1868,7 @@ async function loadShares() {
 async function deleteShare(slug) {
   if (!confirm('Supprimer ce lien de partage ?')) return;
   try {
-    const r = await apiFetch('DELETE', `/api/shares/${slug}`);
+    const r = await apiFetch('DELETE', `/api/shares/${encodeURIComponent(slug)}`);
     if (r.ok) { toast('Lien supprimé', 'success'); loadShares(); }
     else { const d = await r.json(); toast(d.error || 'Erreur', 'error'); }
   } catch { toast('Erreur réseau', 'error'); }
@@ -1936,7 +1936,48 @@ function escHtml(s) {
 }
 
 function escAttr(s) { return escHtml(s); }
-function esc(s) { return String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
+// ── Actions ───────────────────────────────────────────────────────────────────
+// Rendered rows never build JavaScript out of a file name: they carry their data in
+// escaped data-* attributes, and one delegated listener per event reads them back.
+function dataAttrs(action, data, kind = 'action') {
+  let attrs = `data-${kind}="${escAttr(action)}"`;
+  for (const [key, value] of Object.entries(data || {})) attrs += ` data-${key}="${escAttr(value)}"`;
+  return attrs;
+}
+
+const clickActions = {
+  open: el => loadFiles(el.dataset.path),
+  renameFolder: (el, e) => startRenameFolder(e, el.dataset.path, el.dataset.name),
+  share: el => openShareModal(el.dataset.path, el.dataset.name, el.dataset.folder === '1'),
+  delete: el => deleteItem(el.dataset.path, el.dataset.folder === '1'),
+  copyUrl: el => copyPublicURL(el.dataset.url),
+  publish: el => publishFile(el.dataset.path),
+  unpublish: el => unpublishFile(el.dataset.path),
+  download: el => downloadFile(el.dataset.path, el.dataset.name),
+  ai: el => openAiModal(el.dataset.path),
+  copyShare: el => navigator.clipboard.writeText(el.dataset.url).then(() => toast('Copié', 'success')),
+  deleteShare: el => deleteShare(el.dataset.slug),
+  removeTag: el => removeModalTag(Number(el.dataset.index)),
+  sort: el => setSort(el.dataset.key),
+};
+
+const dblclickActions = {
+  rename: el => startRename(el, el.dataset.path, el.dataset.name),
+  renameFolder: (el, e) => startRenameFolder(e, el.dataset.path, el.dataset.name),
+  gridRename: (el, e) => startGridRename(e, el.dataset.path, el.dataset.name),
+};
+
+function dispatchAction(actions, attr) {
+  return e => {
+    const el = e.target.closest(`[data-${attr}]`);
+    if (!el) return;
+    const run = actions[el.dataset[attr]];
+    if (run) run(el, e);
+  };
+}
+
+document.addEventListener('click', dispatchAction(clickActions, 'action'));
+document.addEventListener('dblclick', dispatchAction(dblclickActions, 'dblaction'));
 
 // ── AI Modal ──────────────────────────────────────────────────────────────────
 let currentAiModalPath = null;
@@ -2005,7 +2046,7 @@ async function renderAiPreview(item) {
 function renderModalTags() {
   const container = document.getElementById('ai-modal-tags');
   container.innerHTML = modalTags.map((t, i) =>
-    `<span class="file-tag">${escHtml(t)} <button class="tag-remove" onclick="removeModalTag(${i})">×</button></span>`
+    `<span class="file-tag">${escHtml(t)} <button class="tag-remove" ${dataAttrs('removeTag', { index: i })}>×</button></span>`
   ).join('');
 }
 
