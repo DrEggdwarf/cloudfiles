@@ -56,7 +56,9 @@ var db *sql.DB
 
 func initDB() error {
 	var err error
-	db, err = sql.Open("sqlite", dbPath)
+	// Without a busy timeout a write that meets another (e.g. the async view counter of /s/)
+	// fails at once with "database is locked" instead of waiting its turn.
+	db, err = sql.Open("sqlite", dbPath+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		return err
 	}
@@ -1746,7 +1748,7 @@ func handleSuggest(w http.ResponseWriter, r *http.Request) {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-func main() {
+func loadConfig() {
 	adminPassword = getenv("ADMIN_PASSWORD", "changeme-admin")
 	authToken = getenv("AUTH_TOKEN", "changeme-token")
 	baseURL = strings.TrimRight(getenv("BASE_URL", "https://cloud.robin-borg.dev"), "/")
@@ -1754,21 +1756,10 @@ func main() {
 	dbPath = getenv("DB_PATH", "/data/cloud.db")
 	port = getenv("PORT", "8080")
 	anthropicKey = getenv("ANTHROPIC_API_KEY", "")
+}
 
-	if err := os.MkdirAll(filesDir, 0755); err != nil {
-		log.Fatalf("Could not create files dir: %v", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
-		log.Fatalf("Could not create db dir: %v", err)
-	}
-	if err := initDB(); err != nil {
-		log.Fatalf("Database init error: %v", err)
-	}
-	defer db.Close()
-	if err := initTemplates(); err != nil {
-		log.Fatalf("Template init error: %v", err)
-	}
-
+// newServer builds every route behind the security middleware; main and the tests share it.
+func newServer() http.Handler {
 	mux := http.NewServeMux()
 
 	// Public
@@ -1805,7 +1796,27 @@ func main() {
 	}))
 	mux.HandleFunc("/api/shares", adminAuth(handleListShares))
 
-	handler := securityHeaders(mux)
+	return securityHeaders(mux)
+}
+
+func main() {
+	loadConfig()
+
+	if err := os.MkdirAll(filesDir, 0755); err != nil {
+		log.Fatalf("Could not create files dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+		log.Fatalf("Could not create db dir: %v", err)
+	}
+	if err := initDB(); err != nil {
+		log.Fatalf("Database init error: %v", err)
+	}
+	defer db.Close()
+	if err := initTemplates(); err != nil {
+		log.Fatalf("Template init error: %v", err)
+	}
+
+	handler := newServer()
 	log.Printf("Cloud server listening on :%s (base: %s, files: %s)", port, baseURL, filesDir)
 	if err := http.ListenAndServe(":"+port, handler); err != nil {
 		log.Fatalf("Server error: %v", err)
