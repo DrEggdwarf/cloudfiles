@@ -166,6 +166,20 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	return true
 }
 
+// Exceeded tells whether ip already used its quota, without spending a request.
+func (rl *RateLimiter) Exceeded(ip string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	now := time.Now()
+	count := 0
+	for _, t := range rl.entries[ip] {
+		if now.Sub(t) < rl.window {
+			count++
+		}
+	}
+	return count >= rl.max
+}
+
 var (
 	generalRL = newRateLimiter(120, time.Minute)
 	authRL    = newRateLimiter(5, 15*time.Minute)
@@ -189,14 +203,17 @@ func clientIP(r *http.Request) string {
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// CORS — allow browser extensions and configured origins
+		// WebDAV is for native clients: no CORS, and its OPTIONS must reach the handler,
+		// which answers with the DAV capabilities clients probe for.
+		dav := isDAVPath(r.URL.Path)
 		origin := r.Header.Get("Origin")
-		if origin != "" {
+		if origin != "" && !dav {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 			w.Header().Set("Access-Control-Max-Age", "86400")
 		}
-		if r.Method == http.MethodOptions {
+		if r.Method == http.MethodOptions && !dav {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -641,7 +658,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "Upload rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
-	if err := r.ParseMultipartForm(512 << 20); err != nil {
+	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
 		jsonError(w, "Could not parse form (file too large?)", http.StatusBadRequest)
 		return
 	}
@@ -747,13 +764,18 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rel := toRelPath(full)
+	// safePath drops "." and "..", so "?path=.." would otherwise wipe the whole store.
+	if err := checkRel(rel); err != nil {
+		jsonError(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
 	if err := os.RemoveAll(full); err != nil {
 		jsonError(w, "Could not delete", http.StatusInternalServerError)
 		return
 	}
-	db.Exec(`DELETE FROM slugs WHERE path = ?`, rel)
-	db.Exec(`DELETE FROM shares WHERE path = ?`, rel)
-	db.Exec(`DELETE FROM file_meta WHERE path = ?`, rel)
+	if err := forgetPath(rel); err != nil {
+		log.Printf("delete: could not clean records: %v", err)
+	}
 	jsonOK(w, map[string]interface{}{"success": true, "message": "Deleted successfully"})
 }
 
@@ -805,9 +827,9 @@ func handleRename(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "Could not rename", http.StatusInternalServerError)
 		return
 	}
-	db.Exec(`UPDATE slugs SET path = ? WHERE path = ?`, newRel, oldRel)
-	db.Exec(`UPDATE shares SET path = ?, filename = ? WHERE path = ?`, newRel, newName, oldRel)
-	db.Exec(`UPDATE file_meta SET path = ? WHERE path = ?`, newRel, oldRel)
+	if err := movePath(oldRel, newRel); err != nil {
+		log.Printf("rename: could not move records: %v", err)
+	}
 	jsonOK(w, map[string]interface{}{"success": true, "message": "Renamed successfully", "new_path": newRel})
 }
 
@@ -1756,6 +1778,11 @@ func loadConfig() {
 	dbPath = getenv("DB_PATH", "/data/cloud.db")
 	port = getenv("PORT", "8080")
 	anthropicKey = getenv("ANTHROPIC_API_KEY", "")
+	if err := configureDAV(os.Getenv("DAV_USER"), os.Getenv("DAV_PASSWORD_SHA256")); err != nil {
+		log.Printf("WebDAV disabled: %v", err)
+	} else {
+		log.Printf("WebDAV enabled on %s/", davPrefix)
+	}
 }
 
 // newServer builds every route behind the security middleware; main and the tests share it.
@@ -1796,6 +1823,11 @@ func newServer() http.Handler {
 	}))
 	mux.HandleFunc("/api/shares", adminAuth(handleListShares))
 
+	// WebDAV (own Basic credentials, see dav.go)
+	dav := newDAVHandler()
+	mux.Handle(davPrefix, dav)
+	mux.Handle(davPrefix+"/", dav)
+
 	return securityHeaders(mux)
 }
 
@@ -1815,6 +1847,7 @@ func main() {
 	if err := initTemplates(); err != nil {
 		log.Fatalf("Template init error: %v", err)
 	}
+	removeDAVLeftovers(filesDir)
 
 	handler := newServer()
 	log.Printf("Cloud server listening on :%s (base: %s, files: %s)", port, baseURL, filesDir)
