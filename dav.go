@@ -175,31 +175,52 @@ func newDAVHandler() http.Handler {
 			http.NotFound(w, r)
 			return
 		}
-		key := clientIP(r)
-		if davFails.Blocked(key) {
+		switch davAuthenticate(r) {
+		case davAuthBlocked:
 			tooManyDAV(w)
 			return
-		}
-		user, pass, ok := r.BasicAuth()
-		if !ok {
+		case davAuthRefused:
 			challengeDAV(w)
 			return
-		}
-		ok, blocked := davFails.Check(key, func() bool { return checkDAVCredentials(user, pass) })
-		if blocked {
-			tooManyDAV(w)
-			return
-		}
-		if !ok {
-			challengeDAV(w)
-			return
-		}
-		if !davRL.Allow(key) {
+		case davAuthBusy:
 			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
 			return
 		}
 		serveDAV(dav, fs, w, r)
 	})
+}
+
+type davAuth int
+
+const (
+	davAuthOK davAuth = iota
+	davAuthRefused
+	davAuthBlocked // too many wrong credentials from this client
+	davAuthBusy    // over this client's request quota
+)
+
+// davAuthenticate checks the WebDAV credentials, counting the wrong ones per client, then spends one request of the
+// client's quota. WebDAV and the link API (davlinks.go) share both counters.
+func davAuthenticate(r *http.Request) davAuth {
+	key := clientIP(r)
+	if davFails.Blocked(key) {
+		return davAuthBlocked
+	}
+	user, pass, ok := r.BasicAuth()
+	if !ok {
+		return davAuthRefused
+	}
+	ok, blocked := davFails.Check(key, func() bool { return checkDAVCredentials(user, pass) })
+	if blocked {
+		return davAuthBlocked
+	}
+	if !ok {
+		return davAuthRefused
+	}
+	if !davRL.Allow(key) {
+		return davAuthBusy
+	}
+	return davAuthOK
 }
 
 func challengeDAV(w http.ResponseWriter) {

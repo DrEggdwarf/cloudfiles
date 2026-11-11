@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"mime"
 	"net/http"
@@ -537,6 +538,302 @@ func TestMetaNeedsAnExistingFile(t *testing.T) {
 	expectStatus(t, do(t, h, call{"POST", "/api/meta", jsonBody(t, map[string]interface{}{"path": "docs//a.txt", "tags": []string{"x"}}), admin()}), 200)
 	if countRows(t, "file_meta", "docs/a.txt") != 1 {
 		t.Fatal("meta not stored under the listing's key")
+	}
+}
+
+// The link API of WebDAV reaches the files of the WebDAV root, never another, nor through a link.
+func TestDAVLinksStayInTheRoot(t *testing.T) {
+	setupDAV(t)
+	writeFile(t, "prive.txt", "SECRET")
+	writeFile(t, "iji/a.txt", "a")
+	writeFile(t, "iji/"+davTempPrefix+"envol", "en cours")
+	davRoot = "iji"
+	h := newServer()
+	outside := t.TempDir()
+	os.WriteFile(filepath.Join(outside, "x.txt"), []byte("SECRET"), 0644)
+	os.Symlink(filepath.Join(filesDir, "prive.txt"), filepath.Join(filesDir, "iji", "lien.txt"))
+	os.Symlink(outside, filepath.Join(filesDir, "iji", "dehors"))
+
+	for name, want := range map[string]int{
+		"../prive.txt": 404, "/../../prive.txt": 404, "..%2fprive.txt": 404, "iji/../../prive.txt": 404,
+		"lien.txt": 404, "dehors/x.txt": 404, "a.txt\x00.pdf": 404, davTempPrefix + "envol": 404,
+		"/": 400, ".": 400, "": 400, "dehors": 404,
+	} {
+		b, _ := json.Marshal(map[string]interface{}{"path": name, "expires_in": "1d", "max_uses": nil})
+		if rec := linkDo(t, h, "POST", "/api/dav/links", string(b)); rec.Code != want {
+			t.Errorf("create %q: %d, want %d", name, rec.Code, want)
+		}
+		if rec := linkDo(t, h, "GET", "/api/dav/links?path="+url.QueryEscape(name), ""); rec.Code != want {
+			t.Errorf("list %q: %d, want %d", name, rec.Code, want)
+		}
+	}
+	var n int
+	db.QueryRow(`SELECT COUNT(*) FROM shares`).Scan(&n)
+	if n != 0 {
+		t.Fatalf("%d shares made outside the root or through a link", n)
+	}
+	if link := createLink(t, h, "/a.txt", "1d", nil); link.Path != "/a.txt" || countRows(t, "shares", "iji/a.txt") != 1 {
+		t.Fatalf("a file of the root: %+v", link)
+	}
+}
+
+// Only the WebDAV credentials open it: none, wrong ones, the admin password or AUTH_TOKEN never do, and wrong
+// guesses count with those of WebDAV.
+func TestDAVLinksCredentials(t *testing.T) {
+	h, _ := setupDAV(t)
+	writeFile(t, "a.txt", "a")
+	body := `{"path":"a.txt","expires_in":"1d","max_uses":null}`
+	try := func(method, target string, set func(*http.Request)) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, strings.NewReader(body))
+		req.RemoteAddr = "198.51.100.30:1"
+		req.Header.Set("Content-Type", "application/json")
+		set(req)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	refused := []func(*http.Request){
+		func(*http.Request) {},
+		func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+testAdminPassword) },
+		func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+testAuthToken) },
+		func(r *http.Request) { r.SetBasicAuth(testDAVUser, "mauvais") },
+		func(r *http.Request) { r.SetBasicAuth(testDAVUser, testAdminPassword) },
+		func(r *http.Request) { r.SetBasicAuth("admin", testDAVPassword) },
+	}
+	for i, set := range refused {
+		for _, target := range []string{"/api/dav/links", "/api/dav/shared-folders"} {
+			method := "POST"
+			if target != "/api/dav/links" {
+				method = "GET"
+			}
+			rec := try(method, target, set)
+			// The first three carry no Basic credentials: they are refused, never counted
+			if rec.Code != 401 && (i < 3 || rec.Code != 429) {
+				t.Errorf("credentials %d on %s: %d", i, target, rec.Code)
+			}
+			if rec.Header().Get("WWW-Authenticate") != "" {
+				t.Errorf("credentials %d on %s: a browser would prompt", i, target)
+			}
+		}
+	}
+	var n int
+	db.QueryRow(`SELECT COUNT(*) FROM shares`).Scan(&n)
+	if n != 0 {
+		t.Fatal("a link made without the WebDAV credentials")
+	}
+	// Six wrong guesses above: the client is locked out of both the API and WebDAV.
+	good := func(r *http.Request) { r.SetBasicAuth(testDAVUser, testDAVPassword) }
+	if rec := try("POST", "/api/dav/links", good); rec.Code != 429 || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("not locked out: %d", rec.Code)
+	}
+	req := httptest.NewRequest("PROPFIND", "/dav/", nil)
+	req.RemoteAddr = "198.51.100.30:1"
+	good(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 429 {
+		t.Fatalf("WebDAV still open after wrong guesses on the API: %d", rec.Code)
+	}
+
+	// WebDAV off: the API is gone too.
+	configureDAV("", "")
+	expectStatus(t, linkDo(t, h, "GET", "/api/dav/shared-folders", ""), 404)
+}
+
+// It revokes, and lists, only the links it made, in the WebDAV root.
+func TestDAVLinksRevokeOnlyTheirOwn(t *testing.T) {
+	h, _ := setupDAV(t)
+	writeFile(t, "iji/a.txt", "a")
+	writeFile(t, "autre/b.txt", "b")
+	adminShare := decode(t, do(t, h, call{"POST", "/api/share", jsonBody(t, map[string]string{"path": "iji/a.txt"}), admin()}))["slug"].(string)
+	db.Exec(`INSERT INTO shares (slug, path, filename, created_at, created_by) VALUES ('0123456789abcdef', 'iji/a.txt', 'a.txt', 'now', 'dav:quelquun')`)
+	davRoot = "iji"
+	h = newServer()
+	mine := createLink(t, h, "a.txt", "7d", nil)
+	if links := listLinks(t, h, "a.txt"); len(links) != 1 || links[0].Slug != mine.Slug {
+		t.Fatalf("lists more than its own: %+v", links)
+	}
+	// A live share it did not make says so (409): the client must not take it for gone. An unknown slug is 404.
+	for slug, want := range map[string]int{adminShare: 409, "0123456789abcdef": 409, strings.ToUpper(mine.Slug): 404,
+		mine.Slug + "0": 404, "%00": 404, "fedcba9876543210": 404} {
+		for _, method := range []string{"GET", "DELETE"} {
+			if rec := linkDo(t, h, method, "/api/dav/links/"+slug, ""); rec.Code != want {
+				t.Errorf("%s %q: %d, want %d", method, slug, rec.Code, want)
+			}
+		}
+	}
+	if rec := linkDo(t, h, "DELETE", "/api/dav/links/../"+mine.Slug, ""); rec.Code < 300 {
+		t.Errorf("revoked through ..: %d", rec.Code)
+	}
+	if countRows(t, "shares", "iji/a.txt") != 3 {
+		t.Fatal("a link it did not make is gone")
+	}
+	expectStatus(t, do(t, h, call{method: "GET", target: "/s/" + adminShare}), 200)
+	if rec := linkDo(t, h, "GET", "/api/dav/links/"+mine.Slug, ""); rec.Code != 200 || !strings.Contains(rec.Body.String(), `"path":"/a.txt"`) {
+		t.Fatalf("its own link: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Its own link, once outside the WebDAV root, is not its business any more, and it says so.
+	davRoot = "autre"
+	h = newServer()
+	expectStatus(t, linkDo(t, h, "DELETE", "/api/dav/links/"+mine.Slug, ""), 409)
+	expectStatus(t, linkDo(t, h, "GET", "/api/dav/links/"+mine.Slug, ""), 409)
+	if countRows(t, "shares", "iji/a.txt") != 3 {
+		t.Fatal("a link outside the root was revoked")
+	}
+
+	// A new name for the WebDAV user keeps its links its own.
+	davRoot = "iji"
+	h = newServer()
+	if err := configureDAV("renomme", bcryptOf(t, testDAVPassword)); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("GET", "/api/dav/links?path=a.txt", nil)
+	req.RemoteAddr = "192.0.2.21:1"
+	req.SetBasicAuth("renomme", testDAVPassword)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), mine.Slug) {
+		t.Fatalf("links lost with DAV_USER: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// The share page finds its file through safePath, which trims names: a name it would read as another gets no link,
+// and a link whose file is renamed so is served nothing.
+func TestDAVLinksTwinNames(t *testing.T) {
+	setupDAV(t)
+	writeFile(t, "prive.txt", "SECRET-HORS-DU-DAV")
+	writeFile(t, "iji/Plan.pdf", "VRAI-PLAN")
+	writeFile(t, "iji/Plan.pdf ", "leurre")
+	writeFile(t, "iji/Plan.pdf ", "leurre")
+	writeFile(t, "iji/ Plan.pdf", "leurre")
+	writeFile(t, "iji/Prive /x.txt", "leurre")
+	writeFile(t, "iji/lien.txt ", "leurre")
+	writeFile(t, "iji/b.txt", "b")
+	os.Symlink(filepath.Join(filesDir, "prive.txt"), filepath.Join(filesDir, "iji", "lien.txt"))
+	davRoot = "iji"
+	h := newServer()
+	for _, name := range []string{"Plan.pdf ", "Plan.pdf ", " Plan.pdf", "Prive /x.txt", "lien.txt "} {
+		b, _ := json.Marshal(map[string]interface{}{"path": name, "expires_in": "1d", "max_uses": nil})
+		if rec := linkDo(t, h, "POST", "/api/dav/links", string(b)); rec.Code != 404 {
+			t.Errorf("a link for the twin %q: %d", name, rec.Code)
+		}
+	}
+	link := createLink(t, h, "b.txt", "1d", nil)
+	expectStatus(t, davDo(t, h, "MOVE", "/dav/b.txt", "", "Destination", "/dav/lien.txt%20%20"), 201)
+	if rec := do(t, h, call{method: "GET", target: "/s/" + link.Slug + "/dl"}); rec.Code == 200 || strings.Contains(rec.Body.String(), "SECRET") {
+		t.Fatalf("a renamed link serves another file: %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+// A bounded link of the API is bounded: downloads are reserved one by one, and its preview (the whole file) is shut.
+func TestDAVLinksDownloadBound(t *testing.T) {
+	h, _ := setupDAV(t)
+	writeFile(t, "photo.png", "PNG-ENTIER")
+	link := createLink(t, h, "photo.png", "1d", 1)
+	if rec := do(t, h, call{method: "GET", target: "/s/" + link.Slug}); rec.Code != 200 || strings.Contains(rec.Body.String(), "/preview") {
+		t.Fatalf("the page shows the preview of a bounded link: %d", rec.Code)
+	}
+	if rec := do(t, h, call{method: "GET", target: "/s/" + link.Slug + "/preview"}); rec.Code != http.StatusFound || strings.Contains(rec.Body.String(), "PNG") {
+		t.Fatalf("preview of a bounded link: %d %q", rec.Code, rec.Body.String())
+	}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	served := 0
+	start := make(chan struct{})
+	for i := 0; i < 30; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			rec := do(t, h, call{method: "GET", target: "/s/" + link.Slug + "/dl"})
+			mu.Lock()
+			if rec.Body.String() == "PNG-ENTIER" {
+				served++
+			}
+			mu.Unlock()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if served != 1 {
+		t.Fatalf("%d downloads served, bound is 1", served)
+	}
+
+	// An admin share keeps its preview, as before.
+	share := decode(t, do(t, h, call{"POST", "/api/share", jsonBody(t, map[string]interface{}{"path": "photo.png", "max_uses": 1}), admin()}))["slug"].(string)
+	expectStatus(t, do(t, h, call{method: "GET", target: "/s/" + share + "/preview"}), 200)
+}
+
+// The admin page must not build JavaScript out of data: no inline handler holds an interpolation.
+
+func TestDAVLinksBounds(t *testing.T) {
+	h, _ := setupDAV(t)
+	writeFile(t, "a.txt", "a")
+	for _, body := range []string{
+		`{"path":"a.txt","expires_in":"1d","max_uses":0}`,
+		`{"path":"a.txt","expires_in":"1d","max_uses":1001}`,
+		`{"path":"a.txt","expires_in":"1d","max_uses":-1}`,
+		`{"path":"a.txt","expires_in":"1d","max_uses":"10"}`,
+		`{"path":"a.txt","expires_in":"1d","max_uses":1.5}`,
+		`{"path":"a.txt","expires_in":"1h","max_uses":null}`,
+		`{"path":"a.txt","expires_in":"custom","max_uses":null}`,
+		`{"path":"a.txt","max_uses":null}`,
+		`{"path":"a.txt","expires_in":"1d","max_uses":null,"label":"x"}`,
+		`{"path":"a.txt","expires_in":"1d","max_uses":null} {"path":"b.txt"}`,
+		`{"path":"` + strings.Repeat("a", davLinkBodyBytes) + `","expires_in":"1d","max_uses":null}`,
+		`[]`,
+		`pas du json`,
+	} {
+		if rec := linkDo(t, h, "POST", "/api/dav/links", body); rec.Code != 400 {
+			t.Errorf("%.60s: %d", body, rec.Code)
+		}
+	}
+	ok := `{"path":"a.txt","expires_in":"1d","max_uses":1000}`
+	for _, ct := range []string{"", "text/plain", "application/x-www-form-urlencoded", "multipart/form-data"} {
+		if rec := davDo(t, h, "POST", "/api/dav/links", ok, "Content-Type", ct); rec.Code != http.StatusUnsupportedMediaType {
+			t.Errorf("Content-Type %q: %d", ct, rec.Code)
+		}
+	}
+	var n int
+	db.QueryRow(`SELECT COUNT(*) FROM shares`).Scan(&n)
+	if n != 0 {
+		t.Fatal("a link made out of bounds")
+	}
+
+	// At most davMaxLinks live links; expired ones and other makers' do not count.
+	tx, _ := db.Begin()
+	for i := 0; i < davMaxLinks-1; i++ {
+		tx.Exec(`INSERT INTO shares (slug, path, filename, created_at, created_by) VALUES (?, 'a.txt', 'a.txt', 'now', ?)`, fmt.Sprintf("%016x", i), davCreator())
+	}
+	tx.Exec(`INSERT INTO shares (slug, path, filename, created_at, created_by, expires_at) VALUES ('ffff000000000001', 'a.txt', 'a.txt', 'now', ?, '2020-01-01T00:00:00Z')`, davCreator())
+	tx.Exec(`INSERT INTO shares (slug, path, filename, created_at) VALUES ('ffff000000000002', 'a.txt', 'a.txt', 'now')`)
+	tx.Commit()
+	expectStatus(t, linkDo(t, h, "POST", "/api/dav/links", ok), 201)
+	expectStatus(t, linkDo(t, h, "POST", "/api/dav/links", ok), http.StatusUnprocessableEntity)
+
+	// Writes per client and per minute, refused ones included.
+	db.Exec(`DELETE FROM shares`)
+	davLinkWrites = newRateLimiter(60, time.Minute)
+	codes := map[int]int{}
+	for i := 0; i < 70; i++ {
+		codes[linkDo(t, h, "POST", "/api/dav/links", ok).Code]++
+	}
+	if codes[201] != 60 || codes[429] != 10 {
+		t.Fatalf("writes per minute: %v", codes)
+	}
+	expectStatus(t, linkDo(t, h, "DELETE", "/api/dav/links/0000000000000000", ""), 429)
+}
+
+// No CORS on the link API: a page of another site gets no preflight through, and nothing to read.
+func TestDAVLinksHaveNoCORS(t *testing.T) {
+	h, _ := setupDAV(t)
+	for _, method := range []string{"OPTIONS", "GET"} {
+		rec := do(t, h, call{method: method, target: "/api/dav/shared-folders", headers: map[string]string{
+			"Origin": "https://ailleurs.example", "Access-Control-Request-Method": "POST"}})
+		if rec.Header().Get("Access-Control-Allow-Origin") != "" || rec.Code == 204 || rec.Code == 200 {
+			t.Errorf("%s: %d, CORS %q", method, rec.Code, rec.Header().Get("Access-Control-Allow-Origin"))
+		}
 	}
 }
 

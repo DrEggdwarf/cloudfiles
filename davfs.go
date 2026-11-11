@@ -59,6 +59,58 @@ func (d *davFS) dbRel(name string) string {
 	return d.prefix + "/" + rel
 }
 
+// davName is the WebDAV name ("/a/b") of a cloud.db key, when the key lies in the WebDAV root ("/" for the root).
+func (d *davFS) davName(rel string) (string, bool) {
+	if rel != davRel(rel) {
+		return "", false
+	}
+	if d.prefix == "" {
+		return "/" + rel, true
+	}
+	if rel == d.prefix {
+		return "/", true
+	}
+	if inner, ok := strings.CutPrefix(rel, d.prefix+"/"); ok {
+		return "/" + inner, true
+	}
+	return "", false
+}
+
+// coversRoot tells whether a cloud.db key is the WebDAV root or a folder above it: sharing it shares the whole root.
+func (d *davFS) coversRoot(rel string) bool {
+	if rel == "." {
+		rel = ""
+	}
+	if rel != davRel(rel) {
+		return false
+	}
+	return rel == d.prefix || rel == "" || strings.HasPrefix(d.prefix, rel+"/")
+}
+
+// linkTarget resolves a WebDAV name to a regular file of the root, as WebDAV would (no way out, no symbolic link),
+// and gives its cloud.db key. The share page finds its file through safePath, which trims each name: a name it would
+// read as another ("Plan.pdf " for "Plan.pdf", a twin of a symbolic link) gets no link.
+func (d *davFS) linkTarget(name string) (string, error) {
+	full, err := d.resolve(name)
+	if err != nil {
+		return "", err
+	}
+	if !servedAsIs(d.dbRel(name)) {
+		return "", os.ErrNotExist
+	}
+	fi, err := os.Lstat(full)
+	if err != nil {
+		return "", err
+	}
+	if fi.IsDir() {
+		return "", errNotAFile
+	}
+	if !fi.Mode().IsRegular() {
+		return "", os.ErrPermission
+	}
+	return d.dbRel(name), nil
+}
+
 func (d *davFS) resolve(name string) (string, error) {
 	if strings.ContainsRune(name, 0) {
 		return "", os.ErrNotExist

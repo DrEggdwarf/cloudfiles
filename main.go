@@ -90,6 +90,8 @@ CREATE TABLE IF NOT EXISTS shares (
 	db.Exec(`ALTER TABLE shares ADD COLUMN views_count INTEGER NOT NULL DEFAULT 0`)
 	db.Exec(`ALTER TABLE shares ADD COLUMN last_viewed_at DATETIME`)
 	db.Exec(`ALTER TABLE shares ADD COLUMN last_downloaded_at DATETIME`)
+	// Who made a share: "" through the admin API, "dav" through the link API of WebDAV (davlinks.go)
+	db.Exec(`ALTER TABLE shares ADD COLUMN created_by TEXT NOT NULL DEFAULT ''`)
 	// File metadata table for AI analysis
 	if _, err = db.Exec(`
 CREATE TABLE IF NOT EXISTS file_meta (
@@ -114,8 +116,9 @@ func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// CORS — allow browser extensions and configured origins
 		// WebDAV is for native clients: no CORS, and its OPTIONS must reach the handler,
-		// which answers with the DAV capabilities clients probe for.
-		dav := isDAVPath(r.URL.Path)
+		// which answers with the DAV capabilities clients probe for. Its link API neither: a page of
+		// another site never gets to call it.
+		dav := isDAVPath(r.URL.Path) || isDAVLinksPath(r.URL.Path)
 		origin := r.Header.Get("Origin")
 		if origin != "" && !dav {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
@@ -170,6 +173,13 @@ func safePath(base, rel string) (string, error) {
 		return "", fmt.Errorf("path traversal detected")
 	}
 	return target, nil
+}
+
+// servedAsIs tells whether safePath reads a stored path as itself: it trims and drops names, so a path with a name
+// it rewrites would lead to another file (or through a symbolic link of the same name).
+func servedAsIs(rel string) bool {
+	full, err := safePath(filesDir, rel)
+	return err == nil && full == filepath.Join(filesDir, filepath.FromSlash(rel))
 }
 
 // generateSlug generates n random bytes encoded as hex (n bytes → 2n hex chars).
@@ -1035,21 +1045,40 @@ func handleListShares(w http.ResponseWriter, r *http.Request) {
 			s.MaxUses = &maxUses
 		}
 		s.URL = baseURL + "/s/" + s.Slug
-		s.Status = "active"
-		if s.ExpiresAt != "" {
-			if t, err := time.Parse(time.RFC3339, s.ExpiresAt); err == nil && time.Now().After(t) {
-				s.Status = "expired"
-			}
-		}
-		if s.MaxUses != nil && *s.MaxUses > 0 && s.UsesCount >= *s.MaxUses {
-			s.Status = "exhausted"
-		}
+		s.Status = shareStatus(s.ExpiresAt, maxUses, s.UsesCount, time.Now())
 		shares = append(shares, s)
 	}
 	if shares == nil {
 		shares = []ShareItem{}
 	}
 	jsonOK(w, map[string]interface{}{"shares": shares})
+}
+
+// reserveShareUse counts one download if the share still has one to give, in one statement: parallel downloads
+// cannot all pass the bound.
+func reserveShareUse(slug string) bool {
+	res, err := db.Exec(`UPDATE shares SET uses_count = uses_count + 1, last_downloaded_at = ?
+		WHERE slug = ? AND (max_uses IS NULL OR max_uses <= 0 OR uses_count < max_uses)`,
+		time.Now().UTC().Format(time.RFC3339), slug)
+	if err != nil {
+		return false
+	}
+	n, _ := res.RowsAffected()
+	return n == 1
+}
+
+// shareStatus is "active", "expired" or "exhausted" (which wins), as the share page decides; maxUses <= 0 is no bound.
+func shareStatus(expiresAt string, maxUses, usesCount int, now time.Time) string {
+	status := "active"
+	if expiresAt != "" {
+		if t, err := time.Parse(time.RFC3339, expiresAt); err == nil && now.After(t) {
+			status = "expired"
+		}
+	}
+	if maxUses > 0 && usesCount >= maxUses {
+		status = "exhausted"
+	}
+	return status
 }
 
 func handleDeleteShare(w http.ResponseWriter, r *http.Request) {
@@ -1176,10 +1205,11 @@ func handleShareSlug(w http.ResponseWriter, r *http.Request) {
 		label     string
 		createdAt string
 		isFolder  int
+		createdBy string
 	)
-	err := db.QueryRow(`SELECT path, filename, filesize, mimetype, expires_at, max_uses, uses_count, label, created_at, is_folder
-		FROM shares WHERE slug = ?`, slug).
-		Scan(&filePath, &filename, &filesize, &mime, &expiresAt, &maxUses, &usesCount, &label, &createdAt, &isFolder)
+	err := db.QueryRow(`SELECT path, filename, filesize, mimetype, expires_at, max_uses, uses_count, label, created_at, is_folder,
+		COALESCE(created_by, '') FROM shares WHERE slug = ?`, slug).
+		Scan(&filePath, &filename, &filesize, &mime, &expiresAt, &maxUses, &usesCount, &label, &createdAt, &isFolder, &createdBy)
 	if err == sql.ErrNoRows {
 		renderPage(w, FilePageData{IsShare: true, Error: "Ce lien de partage n'existe pas ou a été supprimé."})
 		return
@@ -1197,10 +1227,14 @@ func handleShareSlug(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// Check max uses
-	if maxUses.Valid && maxUses.Int64 > 0 && int64(usesCount) >= maxUses.Int64 {
+	bounded := maxUses.Valid && maxUses.Int64 > 0
+	if bounded && int64(usesCount) >= maxUses.Int64 {
 		renderPage(w, FilePageData{IsShare: true, Error: "Ce lien de partage a atteint sa limite de téléchargements."})
 		return
 	}
+	// A link of the WebDAV link API that bounds its downloads shows no preview: the preview is the whole file, and
+	// would let anyone read it past the bound.
+	noPreview := bounded && strings.HasPrefix(createdBy, davCreator())
 
 	// Track view when page is accessed (not for direct downloads)
 	if action == "" || action == "preview" {
@@ -1209,7 +1243,7 @@ func handleShareSlug(w http.ResponseWriter, r *http.Request) {
 	}
 
 	full, err := safePath(filesDir, filePath)
-	if err != nil {
+	if err != nil || !servedAsIs(filePath) {
 		renderPage(w, FilePageData{IsShare: true, Error: "Chemin invalide."})
 		return
 	}
@@ -1222,8 +1256,10 @@ func handleShareSlug(w http.ResponseWriter, r *http.Request) {
 				renderPage(w, FilePageData{IsShare: true, Error: "Ce dossier n'existe plus sur le serveur."})
 				return
 			}
-			db.Exec(`UPDATE shares SET uses_count = uses_count + 1, last_downloaded_at = ? WHERE slug = ?`,
-				time.Now().UTC().Format(time.RFC3339), slug)
+			if !reserveShareUse(slug) {
+				renderPage(w, FilePageData{IsShare: true, Error: "Ce lien de partage a atteint sa limite de téléchargements."})
+				return
+			}
 			zipName := filename + ".zip"
 			w.Header().Set("Content-Type", "application/zip")
 			w.Header().Set("Content-Disposition", contentDisposition("attachment", zipName))
@@ -1254,14 +1290,16 @@ func handleShareSlug(w http.ResponseWriter, r *http.Request) {
 				renderPage(w, FilePageData{IsShare: true, Error: "Ce fichier n'existe plus sur le serveur."})
 				return
 			}
-			db.Exec(`UPDATE shares SET uses_count = uses_count + 1, last_downloaded_at = ? WHERE slug = ?`,
-				time.Now().UTC().Format(time.RFC3339), slug)
+			if !reserveShareUse(slug) {
+				renderPage(w, FilePageData{IsShare: true, Error: "Ce lien de partage a atteint sa limite de téléchargements."})
+				return
+			}
 			w.Header().Set("Content-Type", mime)
 			w.Header().Set("Content-Disposition", contentDisposition("attachment", filename))
 			http.ServeFile(w, r, full)
 		}
 	case "preview":
-		if isFolder == 1 {
+		if isFolder == 1 || noPreview {
 			// Folders have no preview — redirect to page
 			http.Redirect(w, r, "/s/"+slug, http.StatusFound)
 			return
@@ -1311,7 +1349,7 @@ func handleShareSlug(w http.ResponseWriter, r *http.Request) {
 			Filename:    filename,
 			Filesize:    fmtSize(filesize),
 			Mimetype:    mime,
-			IsImage:     isImageMime(mime),
+			IsImage:     isImageMime(mime) && !noPreview,
 			PreviewURL:  "/s/" + slug + "/preview",
 			DownloadURL: "/s/" + slug + "/dl",
 			Label:       label,
@@ -1722,6 +1760,10 @@ func newServer() http.Handler {
 	dav := newDAVHandler()
 	mux.Handle(davPrefix, dav)
 	mux.Handle(davPrefix+"/", dav)
+	// The link API of the WebDAV user (same credentials, its root only, see davlinks.go)
+	links := newDAVLinksHandler()
+	mux.Handle(strings.TrimSuffix(davLinksPrefix, "/"), links)
+	mux.Handle(davLinksPrefix, links)
 
 	return securityHeaders(mux)
 }
